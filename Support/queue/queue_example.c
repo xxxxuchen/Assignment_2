@@ -18,6 +18,7 @@ int main() {
   struct queue_entry *node = queue_new_node(&x);
   queue_insert_tail(&q, node);
 
+
   struct queue_entry *node2 = queue_new_node(&y);
   queue_insert_tail(&q, node2);
 
