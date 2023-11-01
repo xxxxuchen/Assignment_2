@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -12,16 +13,24 @@ typedef void (*sut_task_f)();
 typedef struct task {
   ucontext_t context;
   sut_task_f fn;
+  char *type;
 } Task;
+
+// typedef struct TCB {
+//   Task *task;
+//   char *type;
+// } TCB;
+
+Task *current_task;
 
 void sut_init();
 bool sut_create(sut_task_f fn);
 void sut_yield();
 void sut_exit();
-void sut_open(char *dest, int port);
-void sut_write(char *buf, int size);
-void sut_close();
-char *sut_read();
+int sut_open(char *file_name);
+void sut_close(int fd);
+void sut_write(int fd, char *buf, int size);
+char *sut_read(int fd, char *buf, int size);
 void sut_shutdown();
 
 struct queue task_queue;
@@ -44,8 +53,18 @@ void *C_EXEC(void *args) {
     }
     struct queue_entry *node = queue_pop_head(&task_queue);
     Task *task = (Task *)node->data;
+    current_task = task;
     swapcontext(&C_context, &(task->context));
     printf("return from task\n");
+    if (strcmp(current_task->type, "yield") == 0) {
+      queue_insert_tail(&task_queue, queue_new_node(current_task));
+    } else if (strcmp(current_task->type, "exit") == 0) {
+      printf("exit\n");
+      free(current_task);
+    } else if (strcmp(current_task->type, "open") == 0) {
+      printf("open\n");
+      queue_insert_tail(&wait_queue, queue_new_node(current_task));
+    }
   }
 }
 void *I_EXEC(void *args) { printf("I_EXEC\n"); }
@@ -80,28 +99,69 @@ bool sut_create(sut_task_f fn) {
   return true;
 }
 
+/* Yield sut_yield(): This causes the C-EXEC to take control. The user task's
+context is saved in a task control block (TCB), and the context of C-EXEC is
+loaded and started. The task is then placed at the back of the task ready
+queue.*/
+void sut_yield() {
+  current_task->type = "yield";
+  swapcontext(&(current_task->context), &C_context);
+}
+
+/* Exit/Terminate sut_exit(): This causes the C-EXEC to take control, similar to
+the previous case. The major difference is that the TCB is not updated and the
+task is not inserted back into the task ready queue.*/
+void sut_exit() {
+  current_task->type = "exit";
+  setcontext(&C_context);
+}
+
+/*Open file sut_open(): This causes the C-EXEC to take control. The user task's
+context is saved in a TCB, and the context of C-EXEC is loaded and started,
+allowing the next user task to run. The current task is placed at the back of
+the wait queue. The I-EXEC executes the function that opens the file, and the
+result of the open is returned by sut_open(). This result is an integer, similar
+to the file descriptor returned by the operating system. The OS file descriptor
+can be used, or it can be mapped to another integer using a mapping table
+maintained inside the I-EXEC.*/
+int sut_open(char *file_name) {
+  current_task->type = "open";
+  swapcontext(&(current_task->context), &C_context);
+  return 0;
+}
+
 void hello1() {
   int i;
   for (i = 0; i < 10; i++) {
     printf("Hello world!, this is SUT-One \n");
-    // sut_yield();
+    sut_yield();
   }
-  printf("hello1 exit\n");
-  // sut_exit();
+  sut_exit();
 }
 
-// void hello2() {
-//   int i;
-//   for (i = 0; i < 100; i++) {
-//     printf("Hello world!, this is SUT-Two \n");
-//     sut_yield();
-//   }
-//   sut_exit();
-// }
+void hello2() {
+  int i;
+  for (i = 0; i < 10; i++) {
+    printf("Hello world!, this is SUT-Two \n");
+    sut_yield();
+  }
+  sut_exit();
+}
 
+void hello3() {
+  int i;
+  for (i = 0; i < 10; i++) {
+    printf("Hello world!, this is SUT-Three \n");
+    sut_yield();
+    sut_create(hello1);
+  }
+  sut_exit();
+}
 // for test
 int main() {
   sut_init();
   sut_create(hello1);
+  sut_create(hello2);
+  sut_create(hello3);
   pthread_join(*c_exec_thread, NULL);
 }
