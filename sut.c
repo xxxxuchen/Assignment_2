@@ -16,23 +16,8 @@ typedef struct task {
   char *type;
 } Task;
 
-// typedef struct TCB {
-//   Task *task;
-//   char *type;
-// } TCB;
-
 Task *cur_C_task;
 Task *cur_I_task;
-
-void sut_init();
-bool sut_create(sut_task_f fn);
-void sut_yield();
-void sut_exit();
-int sut_open(char *file_name);
-void sut_close(int fd);
-void sut_write(int fd, char *buf, int size);
-char *sut_read(int fd, char *buf, int size);
-void sut_shutdown();
 
 struct queue task_queue;
 struct queue wait_queue;
@@ -40,12 +25,13 @@ pthread_t *c_exec_thread;
 pthread_t *i_exec_thread;
 ucontext_t C_context;
 ucontext_t *I_context;
-
+char *I_stack;
 FILE *FDT[30] = {NULL};
+char *rd_result;
 
 int open_file(char *filename) {
   FILE *fp;
-  fp = fopen(filename, "w+");
+  fp = fopen(filename, "a+");
   if (fp == NULL) {
     printf("Error opening file\n");
     return -1;
@@ -58,6 +44,52 @@ int open_file(char *filename) {
     }
   }
   return i;
+}
+
+char *read_file(int fd, char *buf, int size) {
+  FILE *fp = FDT[fd];
+  printf("fp is %p\n", fp);
+  if (fp == NULL) {
+    printf("Error reading file\n");
+    return NULL;
+  }
+  rd_result = (char *)malloc(sizeof(char) * size);
+  if (rd_result == NULL) {
+    printf("Memory allocation error\n");
+    return NULL;
+  }
+  if (fgets(rd_result, size, fp) == NULL) {
+    printf("Error reading file\n");
+    free(rd_result);
+    return NULL;
+  }
+  // Copy the rd_result to the provided buffer
+  strncpy(buf, rd_result, size);
+  return rd_result;
+}
+
+void write_file(int fd, char *buf, int size) {
+  FILE *fp = FDT[fd];
+  if (fp == NULL) {
+    printf("Error writing file\n");
+    return;
+  }
+  if (fputs(buf, fp) == EOF) {
+    printf("Error writing file\n");
+    return;
+  }
+}
+
+void close_file(int fd) {
+  FILE *fp = FDT[fd];
+  if (fp == NULL) {
+    printf("Error closing file\n");
+    return;
+  }
+  fclose(fp);
+  free(rd_result);
+  rd_result = NULL;
+  FDT[fd] = NULL;
 }
 
 void *C_EXEC(void *args) {
@@ -84,6 +116,15 @@ void *C_EXEC(void *args) {
     } else if (strcmp(cur_C_task->type, "open") == 0) {
       printf("open\n");
       queue_insert_tail(&wait_queue, queue_new_node(cur_C_task));
+    } else if (strcmp(cur_C_task->type, "read") == 0) {
+      printf("read\n");
+      queue_insert_tail(&wait_queue, queue_new_node(cur_C_task));
+    } else if (strcmp(cur_C_task->type, "write") == 0) {
+      printf("write\n");
+      queue_insert_tail(&wait_queue, queue_new_node(cur_C_task));
+    } else if (strcmp(cur_C_task->type, "close") == 0) {
+      printf("close\n");
+      queue_insert_tail(&wait_queue, queue_new_node(cur_C_task));
     }
   }
 }
@@ -91,8 +132,8 @@ void *C_EXEC(void *args) {
 void *I_EXEC(void *args) {
   I_context = (ucontext_t *)malloc(sizeof(ucontext_t));
   getcontext(I_context);
-  char *stack = (char *)malloc(sizeof(char) * (STACK_SIZE));
-  I_context->uc_stack.ss_sp = stack;
+  I_stack = (char *)malloc(sizeof(char) * (STACK_SIZE));
+  I_context->uc_stack.ss_sp = I_stack;
   I_context->uc_stack.ss_size = sizeof(char) * (STACK_SIZE);
   I_context->uc_link = 0;
 
@@ -112,12 +153,22 @@ void *I_EXEC(void *args) {
       printf("opening...\n");
       swapcontext(I_context, &(task->context));
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
+    } else if (strcmp(task->type, "read") == 0) {
+      printf("reading...\n");
+      swapcontext(I_context, &(task->context));
+      queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
+    } else if (strcmp(task->type, "write") == 0) {
+      printf("writing...\n");
+      swapcontext(I_context, &(task->context));
+      queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
+    } else if (strcmp(task->type, "close") == 0) {
+      printf("closing...\n");
+      swapcontext(I_context, &(task->context));
+      queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
     }
   }
 }
 
-/* During initialization of the SUT library, the first action is to create two
- * kernel-level threads to run C-EXEC and I-EXEC respectively.*/
 void sut_init() {
   task_queue = queue_create();
   wait_queue = queue_create();
@@ -146,31 +197,16 @@ bool sut_create(sut_task_f fn) {
   return true;
 }
 
-/* Yield sut_yield(): This causes the C-EXEC to take control. The user task's
-context is saved in a task control block (TCB), and the context of C-EXEC is
-loaded and started. The task is then placed at the back of the task ready
-queue.*/
 void sut_yield() {
   cur_C_task->type = "yield";
   swapcontext(&(cur_C_task->context), &C_context);
 }
 
-/* Exit/Terminate sut_exit(): This causes the C-EXEC to take control, similar to
-the previous case. The major difference is that the TCB is not updated and the
-task is not inserted back into the task ready queue.*/
 void sut_exit() {
   cur_C_task->type = "exit";
   setcontext(&C_context);
 }
 
-/*Open file sut_open(): This causes the C-EXEC to take control. The user task's
-context is saved in a TCB, and the context of C-EXEC is loaded and started,
-allowing the next user task to run. The current task is placed at the back of
-the wait queue. The I-EXEC executes the function that opens the file, and the
-result of the open is returned by sut_open(). This result is an integer, similar
-to the file descriptor returned by the operating system. The OS file descriptor
-can be used, or it can be mapped to another integer using a mapping table
-maintained inside the I-EXEC.*/
 int sut_open(char *file_name) {
   cur_C_task->type = "open";
   swapcontext(&(cur_C_task->context), &C_context);
@@ -179,6 +215,30 @@ int sut_open(char *file_name) {
   return file_desc;
 }
 
+char *sut_read(int fd, char *buf, int size) {
+  // print FDT first entry
+  cur_C_task->type = "read";
+  swapcontext(&(cur_C_task->context), &C_context);
+  char *data = read_file(fd, buf, size);
+  swapcontext(&(cur_I_task->context), I_context);
+  return data;
+}
+
+void sut_write(int fd, char *buf, int size) {
+  cur_C_task->type = "write";
+  swapcontext(&(cur_C_task->context), &C_context);
+  write_file(fd, buf, size);
+  swapcontext(&(cur_I_task->context), I_context);
+}
+
+void sut_close(int fd) {
+  cur_C_task->type = "close";
+  swapcontext(&(cur_C_task->context), &C_context);
+  close_file(fd);
+  swapcontext(&(cur_I_task->context), I_context);
+}
+
+void sut_shutdown();
 void hello1() {
   printf("hello1\n");
   int fd = sut_open("test.txt");
@@ -193,10 +253,51 @@ void hello2() {
   }
   sut_exit();
 }
+void hello3() {
+  int i, fd;
+  int buf_size = 2048;
+  char read_sbuf[buf_size];
+  fd = sut_open("./test.txt");
+  // sut_yield();
+  if (fd < 0)
+    printf("Error: sut_open() failed in hello3()");
+  else {
+    char *read_result = sut_read(fd, read_sbuf, buf_size);
+    if (read_result != NULL) {
+      printf("%s\n", read_sbuf);
+      // sut_close(fd);
+    } else {
+      printf("Error: sut_read() failed");
+    }
+  }
+
+  sut_exit();
+}
+
+void hello0() {
+  int i, fd;
+  char write_sbuf[128];
+  fd = sut_open("./test5.txt");
+  printf("fd: %d\n", fd);
+  if (fd < 0)
+    printf("Error: sut_open() failed \n");
+  else {
+    for (i = 0; i < 5; i++) {
+      sprintf(write_sbuf, "Hello world!, message from SUT-One i = %d \n", i);
+      sut_write(fd, write_sbuf, strlen(write_sbuf));
+      // sut_yield();
+    }
+    sut_close(fd);
+    // sut_create(hello3);
+  }
+  sut_exit();
+}
 // for test
 int main() {
   sut_init();
-  sut_create(hello1);
-  sut_create(hello2);
+  // sut_create(hello1);
+  // sut_create(hello2);
+  // sut_create(hello3);
+  sut_create(hello0);
   pthread_join(*c_exec_thread, NULL);
 }
