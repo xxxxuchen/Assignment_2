@@ -1,4 +1,5 @@
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,11 +24,13 @@ struct queue task_queue;
 struct queue wait_queue;
 pthread_t *c_exec_thread;
 pthread_t *i_exec_thread;
+pthread_mutex_t *queue_insertion_lock;
 ucontext_t C_context;
 ucontext_t *I_context;
 char *I_stack;
 FILE *FDT[30] = {NULL};
 char *rd_result;
+bool termination_flag = false;
 
 int open_file(char *filename) {
   FILE *fp;
@@ -109,9 +112,12 @@ void *C_EXEC(void *args) {
     swapcontext(&C_context, &(task->context));
     printf("return from task\n");
     if (strcmp(cur_C_task->type, "yield") == 0) {
+      pthread_mutex_lock(queue_insertion_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_C_task));
+      pthread_mutex_unlock(queue_insertion_lock);
     } else if (strcmp(cur_C_task->type, "exit") == 0) {
       printf("exit\n");
+      free(cur_C_task->context.uc_stack.ss_sp);
       free(cur_C_task);
     } else if (strcmp(cur_C_task->type, "open") == 0) {
       printf("open\n");
@@ -127,6 +133,8 @@ void *C_EXEC(void *args) {
       queue_insert_tail(&wait_queue, queue_new_node(cur_C_task));
     }
   }
+  /* when there is no node in the wait queue and no node in the task queue, exit
+   * the c_exec_thread. */
 }
 
 void *I_EXEC(void *args) {
@@ -152,24 +160,34 @@ void *I_EXEC(void *args) {
     if (strcmp(task->type, "open") == 0) {
       printf("opening...\n");
       swapcontext(I_context, &(task->context));
+      pthread_mutex_lock(queue_insertion_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
+      pthread_mutex_unlock(queue_insertion_lock);
     } else if (strcmp(task->type, "read") == 0) {
       printf("reading...\n");
       swapcontext(I_context, &(task->context));
+      pthread_mutex_lock(queue_insertion_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
+      pthread_mutex_unlock(queue_insertion_lock);
     } else if (strcmp(task->type, "write") == 0) {
       printf("writing...\n");
       swapcontext(I_context, &(task->context));
+      pthread_mutex_lock(queue_insertion_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
+      pthread_mutex_unlock(queue_insertion_lock);
     } else if (strcmp(task->type, "close") == 0) {
       printf("closing...\n");
       swapcontext(I_context, &(task->context));
+      pthread_mutex_lock(queue_insertion_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
+      pthread_mutex_unlock(queue_insertion_lock);
     }
   }
+  // TODO: thead termination
 }
 
 void sut_init() {
+  queue_insertion_lock = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
   task_queue = queue_create();
   wait_queue = queue_create();
   queue_init(&task_queue);
@@ -183,6 +201,7 @@ void sut_init() {
 bool sut_create(sut_task_f fn) {
   Task *task = (Task *)malloc(sizeof(Task));
   task->fn = fn;
+  task->type = NULL;
   if (getcontext(&task->context) == -1) {
     printf("getcontext error\n");
     return false;
@@ -192,8 +211,9 @@ bool sut_create(sut_task_f fn) {
   task->context.uc_stack.ss_size = sizeof(char) * (STACK_SIZE);
   task->context.uc_link = 0;
   makecontext(&task->context, fn, 0);
-  // TODO: protect the queue
+  pthread_mutex_lock(queue_insertion_lock);
   queue_insert_tail(&task_queue, queue_new_node(task));
+  pthread_mutex_unlock(queue_insertion_lock);
   return true;
 }
 
@@ -204,7 +224,7 @@ void sut_yield() {
 
 void sut_exit() {
   cur_C_task->type = "exit";
-  setcontext(&C_context);
+  swapcontext(&(cur_C_task->context), &C_context);
 }
 
 int sut_open(char *file_name) {
@@ -238,66 +258,49 @@ void sut_close(int fd) {
   swapcontext(&(cur_I_task->context), I_context);
 }
 
-void sut_shutdown();
+void sut_shutdown() {
+  termination_flag = true;
+  pthread_join(*c_exec_thread, NULL);
+  pthread_join(*i_exec_thread, NULL);
+  free(c_exec_thread);
+  free(i_exec_thread);
+  free(cur_C_task);
+  free(cur_I_task);
+  free(queue_insertion_lock);
+  free(rd_result);
+  free(I_context);
+  free(I_stack);
+}
+
 void hello1() {
-  printf("hello1\n");
-  int fd = sut_open("test.txt");
-  printf("fd: %d\n", fd);
+  int i, fd;
+  char sbuf[128];
+  fd = sut_open("./test4.txt");
+  if (fd < 0)
+    printf("Error: sut_open() failed\n");
+  else {
+    for (i = 0; i < 5; i++) {
+      sprintf(sbuf, "Hello world!, message from SUT-One i = %d \n", i);
+      sut_write(fd, sbuf, strlen(sbuf));
+      sut_yield();
+    }
+    sut_close(fd);
+  }
   sut_exit();
 }
 
 void hello2() {
   int i;
-  for (i = 0; i < 10; i++) {
+  for (i = 0; i < 5; i++) {
     printf("Hello world!, this is SUT-Two \n");
+    sut_yield();
   }
-  sut_exit();
-}
-void hello3() {
-  int i, fd;
-  int buf_size = 2048;
-  char read_sbuf[buf_size];
-  fd = sut_open("./test.txt");
-  // sut_yield();
-  if (fd < 0)
-    printf("Error: sut_open() failed in hello3()");
-  else {
-    char *read_result = sut_read(fd, read_sbuf, buf_size);
-    if (read_result != NULL) {
-      printf("%s\n", read_sbuf);
-      // sut_close(fd);
-    } else {
-      printf("Error: sut_read() failed");
-    }
-  }
-
   sut_exit();
 }
 
-void hello0() {
-  int i, fd;
-  char write_sbuf[128];
-  fd = sut_open("./test5.txt");
-  printf("fd: %d\n", fd);
-  if (fd < 0)
-    printf("Error: sut_open() failed \n");
-  else {
-    for (i = 0; i < 5; i++) {
-      sprintf(write_sbuf, "Hello world!, message from SUT-One i = %d \n", i);
-      sut_write(fd, write_sbuf, strlen(write_sbuf));
-      // sut_yield();
-    }
-    sut_close(fd);
-    // sut_create(hello3);
-  }
-  sut_exit();
-}
-// for test
 int main() {
   sut_init();
-  // sut_create(hello1);
-  // sut_create(hello2);
-  // sut_create(hello3);
-  sut_create(hello0);
-  pthread_join(*c_exec_thread, NULL);
+  sut_create(hello1);
+  sut_create(hello2);
+  sut_shutdown();
 }
