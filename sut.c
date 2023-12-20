@@ -30,7 +30,7 @@ struct queue task_queue;
 struct queue wait_queue;
 pthread_t *c_exec_thread;
 pthread_t *i_exec_thread;
-pthread_mutex_t *queue_insertion_lock;
+pthread_mutex_t *queue_lock;
 ucontext_t C_context;
 ucontext_t *I_context;
 char *I_stack;
@@ -113,7 +113,9 @@ void close_file(int fd) {
 
 void *C_EXEC(void *args) {
   while (true) {
+    pthread_mutex_lock(queue_lock);
     struct queue_entry *first_node = queue_peek_front(&task_queue);
+    pthread_mutex_unlock(queue_lock);
     // sleep if there is no task
     if (first_node == NULL) {
       struct timespec ts;
@@ -124,15 +126,17 @@ void *C_EXEC(void *args) {
       cur_C_task = NULL;
       continue;
     }
+    pthread_mutex_lock(queue_lock);
     struct queue_entry *node = queue_pop_head(&task_queue);
+    pthread_mutex_unlock(queue_lock);
     Task *task = (Task *)(node->data);
     cur_C_task = task;
     swapcontext(&C_context, &(task->context));
     // return from the task and resume the C_EXEC thread here
     if (strcmp(cur_C_task->type, "yield") == 0) {
-      pthread_mutex_lock(queue_insertion_lock);
+      pthread_mutex_lock(queue_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_C_task));
-      pthread_mutex_unlock(queue_insertion_lock);
+      pthread_mutex_unlock(queue_lock);
     } else if (strcmp(cur_C_task->type, "exit") == 0) {
       free(cur_C_task->context.uc_stack.ss_sp);
       free(cur_C_task);
@@ -167,7 +171,9 @@ void *I_EXEC(void *args) {
   I_context->uc_link = 0;
 
   while (true) {
+    pthread_mutex_lock(queue_lock);
     struct queue_entry *first_node = queue_peek_front(&wait_queue);
+    pthread_mutex_unlock(queue_lock);
     if (first_node == NULL) {
       struct timespec time;
       time.tv_sec = 0;
@@ -175,29 +181,31 @@ void *I_EXEC(void *args) {
       nanosleep(&time, NULL);
       continue;
     }
+    pthread_mutex_lock(queue_lock);
     struct queue_entry *node = queue_pop_head(&wait_queue);
+    pthread_mutex_unlock(queue_lock);
     Task *task = (Task *)node->data;
     cur_I_task = task;
     if (strcmp(task->type, "open") == 0) {
       swapcontext(I_context, &(task->context));
-      pthread_mutex_lock(queue_insertion_lock);
+      pthread_mutex_lock(queue_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
-      pthread_mutex_unlock(queue_insertion_lock);
+      pthread_mutex_unlock(queue_lock);
     } else if (strcmp(task->type, "read") == 0) {
       swapcontext(I_context, &(task->context));
-      pthread_mutex_lock(queue_insertion_lock);
+      pthread_mutex_lock(queue_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
-      pthread_mutex_unlock(queue_insertion_lock);
+      pthread_mutex_unlock(queue_lock);
     } else if (strcmp(task->type, "write") == 0) {
       swapcontext(I_context, &(task->context));
-      pthread_mutex_lock(queue_insertion_lock);
+      pthread_mutex_lock(queue_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
-      pthread_mutex_unlock(queue_insertion_lock);
+      pthread_mutex_unlock(queue_lock);
     } else if (strcmp(task->type, "close") == 0) {
       swapcontext(I_context, &(task->context));
-      pthread_mutex_lock(queue_insertion_lock);
+      pthread_mutex_lock(queue_lock);
       queue_insert_tail(&task_queue, queue_new_node(cur_I_task));
-      pthread_mutex_unlock(queue_insertion_lock);
+      pthread_mutex_unlock(queue_lock);
     }
     // current I/O task is done, set it to NULL
     cur_I_task = NULL;
@@ -205,7 +213,7 @@ void *I_EXEC(void *args) {
 }
 
 void sut_init() {
-  queue_insertion_lock = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
+  queue_lock = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
   task_queue = queue_create();
   wait_queue = queue_create();
   queue_init(&task_queue);
@@ -229,9 +237,9 @@ bool sut_create(sut_task_f fn) {
   task->context.uc_stack.ss_size = sizeof(char) * (STACK_SIZE);
   task->context.uc_link = 0;
   makecontext(&task->context, fn, 0);
-  pthread_mutex_lock(queue_insertion_lock);
+  pthread_mutex_lock(queue_lock);
   queue_insert_tail(&task_queue, queue_new_node(task));
-  pthread_mutex_unlock(queue_insertion_lock);
+  pthread_mutex_unlock(queue_lock);
   return true;
 }
 
@@ -284,7 +292,7 @@ void sut_shutdown() {
   free(i_exec_thread);
   free(cur_C_task);
   free(cur_I_task);
-  free(queue_insertion_lock);
+  free(queue_lock);
   free(I_context);
   free(I_stack);
 }
